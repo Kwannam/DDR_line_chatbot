@@ -1,0 +1,227 @@
+from flask import Flask, request
+import requests
+import json
+import torch
+from ultralytics import YOLO
+from PIL import Image
+import io
+from concurrent.futures import ThreadPoolExecutor
+
+app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=3)
+
+# Configuration
+LINE_CHANNEL_ACCESS_TOKEN = 'bGkMvEDLmzYSBbUoAzY6T7xN7CaaB95jlW+96WiB88KD4ZMH20xOpTh2TQUzuGoMCQMFQ5ei4sVyaLRA7SkIaO/t2FUE6xk55bGb1FD6N9HCALAF9Dnqgsaz+7xkCGC27cKcB6YSsaclXYpc/FpSqwdB04t89/1O/w1cDnyilFU='
+MODEL_PATH = 'DDR(Rust)0.1.pt'
+
+# โหลด YOLO model
+print("Loading YOLO model...")
+try:
+    model = YOLO(MODEL_PATH, task='classify')
+    print("YOLO model loaded successfully")
+except Exception as e:
+    print(f"Error loading YOLO model: {e}")
+    model = None
+
+def send_line_message(reply_token, messages):
+    """ส่งข้อความไปยัง LINE"""
+    url = 'https://api.line.me/v2/bot/message/reply'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+    }
+    
+    if not isinstance(messages, list):
+        messages = [messages]
+
+    data = {
+        'replyToken': reply_token,
+        'messages': messages
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=3)
+        success = response.status_code == 200
+        print(f"LINE API Response: {response.status_code}")
+        if not success:
+            print(f"Response content: {response.text}")
+        return success
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return False
+
+def analyze_image(image_content):
+    """วิเคราะห์รูปภาพจาก binary content"""
+    try:
+        if model is None:
+            return None, 0
+
+        # แปลง bytes เป็น PIL Image
+        image = Image.open(io.BytesIO(image_content))
+        
+        # วิเคราะห์รูปภาพ
+        results = model.predict(image, verbose=False)
+        
+        if len(results) == 0:
+            return None, 0
+
+        result = results[0]
+        if not hasattr(result, 'probs') or result.probs is None:
+            return None, 0
+
+        # ดึงผลการทำนาย
+        probs = result.probs.data
+        class_idx = int(torch.argmax(probs))
+        confidence = float(probs[class_idx])
+        class_name = result.names[class_idx]
+
+        # ตรวจสอบว่าเป็นคลาสที่ต้องการหรือไม่
+        if class_name not in ['Normal', 'Rust']:
+            return None, 0
+
+        return class_name, confidence
+
+    except Exception as e:
+        print(f"Error analyzing image: {e}")
+        return None, 0
+
+def create_response_messages(class_name, confidence):
+    """สร้างข้อความผลการวิเคราะห์"""
+    # กรณีไม่สามารถระบุผลได้
+    if not class_name or confidence < 0.5:  # เพิ่มความเข้มงวดของ confidence
+        return [{
+            'type': 'text',
+            'text': "⚠️ ไม่สามารถระบุผลได้\n\n"
+                   "🔸 สาเหตุที่เป็นไปได้:\n"
+                   "- ภาพไม่ชัดเจน\n"
+                   "- แสงสว่างไม่เพียงพอ\n"
+                   "- มุมถ่ายไม่เหมาะสม\n"
+                   "- ไม่ใช่ภาพใบทุเรียน\n\n"
+                   "🔸 คำแนะนำ:\n"
+                   "1. ถ่ายในที่มีแสงสว่างเพียงพอ\n"
+                   "2. ถ่ายให้เห็นใบชัดเจน\n"
+                   "3. หลีกเลี่ยงเงาที่บังใบ\n"
+                   "4. ถ่ายในระยะใกล้พอสมควร"
+        }]
+
+    # กรณีเป็นโรคราสนิม
+    if class_name == 'Rust':
+        return [{
+            'type': 'text',
+            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+                   f"⚠️ พบโรคราสนิม (Rust Disease)\n\n"
+                   f"🔸 ลักษณะอาการ:\n"
+                   f"- พบจุดสีน้ำตาลแดงบนใบ\n"
+                   f"- อาจพบผงสปอร์สีส้มใต้ใบ\n\n"
+                   f"🔸 คำแนะนำการจัดการ:\n"
+                   f"1. แยกใบที่เป็นโรคออกและเผาทำลาย\n"
+                   f"2. ฉีดพ่นสารป้องกันกำจัดเชื้อรา\n"
+                   f"3. ควบคุมความชื้นในสวน\n"
+                   f"4. ตรวจสอบใบข้างเคียง"
+        }]
+    
+    # กรณีใบปกติ
+    elif class_name == 'Normal':
+        return [{
+            'type': 'text',
+            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+                   f"✅ ใบปกติ ไม่พบโรค\n\n"
+                   f"🔸 ลักษณะใบ:\n"
+                   f"- ใบมีสีเขียวปกติ\n"
+                   f"- ไม่พบร่องรอยของโรค\n\n"
+                   f"🔸 คำแนะนำการดูแล:\n"
+                   f"1. ดูแลรักษาตามปกติ\n"
+                   f"2. รดน้ำอย่างสม่ำเสมอ\n"
+                   f"3. ให้ปุ๋ยตามกำหนด\n"
+                   f"4. หมั่นตรวจสอบอาการผิดปกติ"
+        }]
+    
+    # กรณีอื่นๆ
+    return [{
+        'type': 'text',
+        'text': "⚠️ ไม่สามารถระบุผลได้\n\n"
+               "โปรดตรวจสอบว่าภาพที่ส่งเป็นภาพใบทุเรียน\n"
+               "และถ่ายภาพในสภาพแสงที่เหมาะสม"
+    }]
+
+def process_image_message(image_id, reply_token):
+    """ประมวลผลรูปภาพและส่งผลลัพธ์"""
+    try:
+        # ดาวน์โหลดรูปภาพ
+        url = f'https://api-data.line.me/v2/bot/message/{image_id}/content'
+        headers = {'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'}
+        
+        response = requests.get(url, headers=headers, timeout=3)
+        if response.status_code != 200:
+            send_line_message(reply_token, [{
+                'type': 'text',
+                'text': '❌ ไม่สามารถดาวน์โหลดรูปภาพได้\nกรุณาลองใหม่อีกครั้ง'
+            }])
+            return
+
+        # วิเคราะห์รูปภาพและส่งผลลัพธ์
+        class_name, confidence = analyze_image(response.content)
+        messages = create_response_messages(class_name, confidence)
+        send_line_message(reply_token, messages)
+
+    except Exception as e:
+        print(f"Error in process_image_message: {e}")
+        send_line_message(reply_token, [{
+            'type': 'text',
+            'text': '❌ เกิดข้อผิดพลาดในการวิเคราะห์\nกรุณาลองใหม่อีกครั้ง'
+        }])
+
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    """จัดการ webhook request"""
+    try:
+        data = request.get_json()
+        if not data or 'events' not in data:
+            return 'OK', 200
+
+        for event in data['events']:
+            if event.get('type') != 'message':
+                continue
+
+            message = event.get('message', {})
+            reply_token = event.get('replyToken')
+
+            if not reply_token:
+                continue
+
+            if message.get('type') == 'image':
+                process_image_message(message.get('id'), reply_token)
+            elif message.get('type') == 'text':
+                text = message.get('text', '').strip().lower()
+                if text in ['help', 'ช่วยเหลือ']:
+                    send_line_message(reply_token, [{
+                        'type': 'text',
+                        'text': "📱 วิธีใช้งานระบบตรวจโรคใบทุเรียน:\n\n"
+                               "1. การถ่ายภาพ:\n"
+                               "- ถ่ายภาพใบทุเรียนในระยะใกล้\n"
+                               "- ให้แสงสว่างเพียงพอ\n"
+                               "- ถ่ายให้เห็นใบชัดเจน\n\n"
+                               "2. การส่งภาพ:\n"
+                               "- ส่งทีละ 1 ภาพ\n"
+                               "- รอผลการวิเคราะห์สักครู่\n\n"
+                               "3. การอ่านผล:\n"
+                               "- ระบบจะแจ้งผลการวิเคราะห์\n"
+                               "- พร้อมคำแนะนำการจัดการ"
+                    }])
+                else:
+                    send_line_message(reply_token, [{
+                        'type': 'text',
+                        'text': "👋 สวัสดีครับ\n\n"
+                               "ยินดีต้อนรับสู่ระบบตรวจโรคใบทุเรียน\n"
+                               "กรุณาส่งรูปภาพใบทุเรียนที่ต้องการตรวจสอบ\n"
+                               "หรือพิมพ์ 'help' เพื่อดูวิธีใช้งาน"
+                    }])
+
+        return 'OK', 200
+
+    except Exception as e:
+        print(f"Error in webhook: {e}")
+        return 'OK', 200
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000)
