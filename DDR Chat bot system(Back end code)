@@ -12,16 +12,27 @@ executor = ThreadPoolExecutor(max_workers=3)
 
 # Configuration
 LINE_CHANNEL_ACCESS_TOKEN = 'bGkMvEDLmzYSBbUoAzY6T7xN7CaaB95jlW+96WiB88KD4ZMH20xOpTh2TQUzuGoMCQMFQ5ei4sVyaLRA7SkIaO/t2FUE6xk55bGb1FD6N9HCALAF9Dnqgsaz+7xkCGC27cKcB6YSsaclXYpc/FpSqwdB04t89/1O/w1cDnyilFU='
-MODEL_PATH = 'DDR(Rust)0.1.pt'
+LEAF_MODEL_PATH = 'Leaf.pt'  # โมเดลตรวจจับใบ
+DISEASE_MODEL_PATH = 'DDR(ALL)0.1.pt'  # โมเดลตรวจจับโรค
 
-# โหลด YOLO model
-print("Loading YOLO model...")
+# โหลดโมเดล
+print("Loading YOLO models...")
 try:
-    model = YOLO(MODEL_PATH, task='classify')
-    print("YOLO model loaded successfully")
+    # โหลดโมเดลตรวจจับใบ
+    leaf_model = YOLO(LEAF_MODEL_PATH)
+    leaf_model.fuse()
+    leaf_model = leaf_model.cpu()
+    
+    # โหลดโมเดลตรวจจับโรค
+    disease_model = YOLO(DISEASE_MODEL_PATH)
+    disease_model.fuse()
+    disease_model = disease_model.cpu()
+    
+    print("Models loaded successfully")
 except Exception as e:
-    print(f"Error loading YOLO model: {e}")
-    model = None
+    print(f"Error loading models: {e}")
+    leaf_model = None
+    disease_model = None
 
 def send_line_message(reply_token, messages):
     """ส่งข้อความไปยัง LINE"""
@@ -50,45 +61,142 @@ def send_line_message(reply_token, messages):
         print(f"Error sending message: {e}")
         return False
 
+def check_if_durian_leaf(image):
+    """ตรวจสอบว่าเป็นใบทุเรียนหรือไม่ด้วยการตรวจสอบหลายเงื่อนไข"""
+    try:
+        if leaf_model is None:
+            print("Leaf detection model not loaded")
+            return False, 0
+
+        # วิเคราะห์ภาพด้วย YOLO classification
+        results = leaf_model(image)[0]
+        
+        # เพิ่มการล็อกข้อมูลสำหรับการ debug
+        print(f"Raw results: {results}")
+        
+        if not hasattr(results, 'probs') or results.probs is None:
+            print("No probability data found")
+            return False, 0
+            
+        # แสดงความน่าจะเป็นของทุกคลาส
+        probs_data = results.probs.data.cpu().numpy()
+        for idx, prob in enumerate(probs_data):
+            class_name = results.names[idx]
+            print(f"Class: {class_name}, Probability: {prob:.3f}")
+        
+        # ดึงค่า confidence และ class สูงสุด
+        class_idx = int(results.probs.argmax())
+        confidence = float(results.probs.max())
+        class_name = results.names[class_idx]
+        
+        print(f"Best match - Class: {class_name}, Confidence: {confidence:.3f}")
+        
+        # ปรับปรุงเงื่อนไขการตรวจสอบ
+        is_durian = False
+        final_confidence = 0
+        
+        if class_name == 'durian_leaf':
+            # ปรับความเข้มงวดของการตรวจจับ
+            confidence_threshold = 0.25  # ลดจาก 0.3
+            
+            # ตรวจสอบความเชื่อมั่น
+            if confidence >= confidence_threshold:
+                is_durian = True
+                final_confidence = confidence
+                print(f"Durian leaf detected with confidence: {confidence:.3f}")
+            else:
+                print(f"Confidence too low: {confidence:.3f} < {confidence_threshold}")
+                
+            # ตรวจสอบความน่าจะเป็นของคลาสอื่น
+            second_best_idx = probs_data.argsort()[-2]
+            second_best_prob = probs_data[second_best_idx]
+            margin = confidence - second_best_prob
+            
+            print(f"Margin from second best class: {margin:.3f}")
+            
+            # ถ้าความต่างน้อยเกินไป อาจไม่แน่ใจ
+            if margin < 0.1:
+                print("Small margin between classes, reducing confidence")
+                final_confidence *= 0.8  # ลดความเชื่อมั่นลง
+        else:
+            print(f"Not a durian leaf: {class_name}")
+            
+        return is_durian, final_confidence
+            
+    except Exception as e:
+        print(f"Error in leaf detection: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        return False, 0
+
+# ส่วนที่เพิ่มเติม: ตรวจสอบผลการทำนายทั้งหมด
+def print_all_probabilities(results):
+    """แสดงความน่าจะเป็นของทุกคลาส"""
+    if hasattr(results, 'probs') and results.probs is not None:
+        probs = results.probs.data.cpu().numpy()
+        for idx, prob in enumerate(probs):
+            class_name = results.names[idx]
+            print(f"Class: {class_name}, Probability: {prob:.3f}")
+
 def analyze_image(image_content):
     """วิเคราะห์รูปภาพจาก binary content"""
     try:
-        if model is None:
+        if disease_model is None:
+            print("Disease model not loaded")
             return None, 0
 
         # แปลง bytes เป็น PIL Image
         image = Image.open(io.BytesIO(image_content))
         
-        # วิเคราะห์รูปภาพ
-        results = model.predict(image, verbose=False)
+        # วิเคราะห์โรคด้วย YOLOv11
+        results = disease_model(image)
+        print(f"Raw results: {results}")  # debug info
         
-        if len(results) == 0:
+        if not results:
+            print("No results from model")
             return None, 0
-
-        result = results[0]
-        if not hasattr(result, 'probs') or result.probs is None:
+            
+        result = results[0]  # get first result
+        print(f"Result object: {result}")  # debug info
+        
+        try:
+            # ดึงผลการทำนายแบบ YOLOv11 classification
+            probabilities = result.probs.data.cpu().numpy()  # แปลงเป็น numpy array
+            class_idx = probabilities.argmax()
+            confidence = float(probabilities[class_idx])
+            class_name = result.names[class_idx]
+            
+            print(f"Debug - Class: {class_name}, Confidence: {confidence}")
+            print(f"All probabilities: {probabilities}")
+            
+            # ตรวจสอบค่า confidence
+            if confidence < 0.2:
+                print(f"Low confidence: {confidence}")
+                return None, 0
+                
+            # ตรวจสอบชื่อคลาส
+            valid_classes = ['Anthracnose', 'Normal', 'Powdery', 'Rust']
+            if class_name not in valid_classes:
+                print(f"Invalid class: {class_name}")
+                return None, 0
+                
+            return class_name, confidence
+            
+        except Exception as e:
+            print(f"Error extracting prediction: {e}")
+            print(f"Result structure: {dir(result)}")  # แสดงโครงสร้างของ result
             return None, 0
-
-        # ดึงผลการทำนาย
-        probs = result.probs.data
-        class_idx = int(torch.argmax(probs))
-        confidence = float(probs[class_idx])
-        class_name = result.names[class_idx]
-
-        # ตรวจสอบว่าเป็นคลาสที่ต้องการหรือไม่
-        if class_name not in ['Normal', 'Rust']:
-            return None, 0
-
-        return class_name, confidence
 
     except Exception as e:
-        print(f"Error analyzing image: {e}")
+        print(f"Error in analyze_image: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return None, 0
 
 def create_response_messages(class_name, confidence):
     """สร้างข้อความผลการวิเคราะห์"""
     # กรณีไม่สามารถระบุผลได้
-    if not class_name or confidence < 0.5:  # เพิ่มความเข้มงวดของ confidence
+    if not class_name or confidence < 0.5:  
         return [{
             'type': 'text',
             'text': "⚠️ ไม่สามารถระบุผลได้\n\n"
@@ -104,22 +212,23 @@ def create_response_messages(class_name, confidence):
                    "4. ถ่ายในระยะใกล้พอสมควร"
         }]
 
-    # กรณีเป็นโรคราสนิม
-    if class_name == 'Rust':
+    # กรณีโรคแอนแทรคโนส
+    if class_name == 'Anthracnose':
         return [{
             'type': 'text',
             'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
-                   f"⚠️ พบโรคราสนิม (Rust Disease)\n\n"
+                   f"⚠️ พบโรคแอนแทรคโนส (Anthracnose Disease)\n\n"
                    f"🔸 ลักษณะอาการ:\n"
-                   f"- พบจุดสีน้ำตาลแดงบนใบ\n"
-                   f"- อาจพบผงสปอร์สีส้มใต้ใบ\n\n"
+                   f"- แผลจุดสีน้ำตาลถึงดำ\n"
+                   f"- แผลมีขอบสีเหลือง\n"
+                   f"- ใบอาจเหี่ยวและร่วง\n\n"
                    f"🔸 คำแนะนำการจัดการ:\n"
-                   f"1. แยกใบที่เป็นโรคออกและเผาทำลาย\n"
+                   f"1. ตัดแต่งกิ่งและใบที่เป็นโรคทิ้ง\n"
                    f"2. ฉีดพ่นสารป้องกันกำจัดเชื้อรา\n"
-                   f"3. ควบคุมความชื้นในสวน\n"
-                   f"4. ตรวจสอบใบข้างเคียง"
+                   f"3. ปรับปรุงการระบายอากาศ\n"
+                   f"4. หลีกเลี่ยงการให้น้ำที่ใบโดยตรง"
         }]
-    
+
     # กรณีใบปกติ
     elif class_name == 'Normal':
         return [{
@@ -134,6 +243,39 @@ def create_response_messages(class_name, confidence):
                    f"2. รดน้ำอย่างสม่ำเสมอ\n"
                    f"3. ให้ปุ๋ยตามกำหนด\n"
                    f"4. หมั่นตรวจสอบอาการผิดปกติ"
+        }]
+
+    # กรณีโรคราแป้ง
+    elif class_name == 'Powdery':
+        return [{
+            'type': 'text',
+            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+                   f"⚠️ พบโรคราแป้ง (Powdery Mildew)\n\n"
+                   f"🔸 ลักษณะอาการ:\n"
+                   f"- พบผงสีขาวคล้ายแป้งบนใบ\n"
+                   f"- ใบอาจบิดเบี้ยวหรือเหี่ยว\n"
+                   f"- อาจพบจุดสีเหลืองบนใบ\n\n"
+                   f"🔸 คำแนะนำการจัดการ:\n"
+                   f"1. ฉีดพ่นสารป้องกันกำจัดเชื้อรา\n"
+                   f"2. เพิ่มการระบายอากาศ\n"
+                   f"3. ลดความชื้นในสวน\n"
+                   f"4. กำจัดวัชพืชรอบต้น"
+        }]
+
+    # กรณีโรคราสนิม
+    elif class_name == 'Rust':
+        return [{
+            'type': 'text',
+            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+                   f"⚠️ พบโรคราสนิม (Rust Disease)\n\n"
+                   f"🔸 ลักษณะอาการ:\n"
+                   f"- พบจุดสีน้ำตาลแดงบนใบ\n"
+                   f"- อาจพบผงสปอร์สีส้มใต้ใบ\n\n"
+                   f"🔸 คำแนะนำการจัดการ:\n"
+                   f"1. แยกใบที่เป็นโรคออกและเผาทำลาย\n"
+                   f"2. ฉีดพ่นสารป้องกันกำจัดเชื้อรา\n"
+                   f"3. ควบคุมความชื้นในสวน\n"
+                   f"4. ตรวจสอบใบข้างเคียง"
         }]
     
     # กรณีอื่นๆ
@@ -170,7 +312,7 @@ def process_image_message(image_id, reply_token):
             'type': 'text',
             'text': '❌ เกิดข้อผิดพลาดในการวิเคราะห์\nกรุณาลองใหม่อีกครั้ง'
         }])
-
+        
 @app.route("/webhook", methods=['POST'])
 def webhook():
     """จัดการ webhook request"""
