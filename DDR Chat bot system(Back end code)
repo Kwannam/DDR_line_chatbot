@@ -5,193 +5,166 @@ import torch
 from ultralytics import YOLO
 from PIL import Image
 import io
+import gc  
 from concurrent.futures import ThreadPoolExecutor
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=3)
 
 # Configuration
-LINE_CHANNEL_ACCESS_TOKEN = 'bGkMvEDLmzYSBbUoAzY6T7xN7CaaB95jlW+96WiB88KD4ZMH20xOpTh2TQUzuGoMCQMFQ5ei4sVyaLRA7SkIaO/t2FUE6xk55bGb1FD6N9HCALAF9Dnqgsaz+7xkCGC27cKcB6YSsaclXYpc/FpSqwdB04t89/1O/w1cDnyilFU='
-LEAF_MODEL_PATH = 'Leaf.pt'  # โมเดลตรวจจับใบ
-DISEASE_MODEL_PATH = 'DDR(ALL)0.1.pt'  # โมเดลตรวจจับโรค
+LINE_CHANNEL_ACCESS_TOKEN = '5hKNTGGelohPAozp2zd/Qlk8/pS2A4RWDvMuHjeNsIoHxI7KKWbLWUHnB925anWaFH/eEMMKALyKN+s/3C/NGCOG6lYRmj56lB4wkEglQsrGPQXloKuu68+CaOAg+xeWJ8TcuNTQrlt88ozb+NwNiAdB04t89/1O/w1cDnyilFU='
 
-# โหลดโมเดล
-print("Loading YOLO models...")
+# โหลดโมเดลทั้งหมด
+logger.info("Loading YOLO models...")
 try:
-    # โหลดโมเดลตรวจจับใบ
-    leaf_model = YOLO(LEAF_MODEL_PATH)
+    leaf_model = YOLO('Leaf.pt')
     leaf_model.fuse()
     leaf_model = leaf_model.cpu()
     
-    # โหลดโมเดลตรวจจับโรค
-    disease_model = YOLO(DISEASE_MODEL_PATH)
-    disease_model.fuse()
-    disease_model = disease_model.cpu()
-    
-    print("Models loaded successfully")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    disease_models = {
+        'antracnose': YOLO('Antracnose0.2.pt').to(device),
+        'normal': YOLO('Normal0.2.pt').to(device),
+        'phytophthora': YOLO('Phytophthora0.2.pt').to(device),
+        'powdery': YOLO('Powdery0.2.pt').to(device),
+        'rust': YOLO('Rust0.2.pt').to(device)
+    }
+    logger.info("Models loaded successfully")
 except Exception as e:
-    print(f"Error loading models: {e}")
+    logger.error(f"Error loading models: {e}", exc_info=True)
     leaf_model = None
-    disease_model = None
+    disease_models = {}
 
 def send_line_message(reply_token, messages):
-    """ส่งข้อความไปยัง LINE"""
     url = 'https://api.line.me/v2/bot/message/reply'
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
     }
     
-    if not isinstance(messages, list):
-        messages = [messages]
-
     data = {
         'replyToken': reply_token,
         'messages': messages
     }
 
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=3)
-        success = response.status_code == 200
-        print(f"LINE API Response: {response.status_code}")
-        if not success:
-            print(f"Response content: {response.text}")
-        return success
-    except Exception as e:
-        print(f"Error sending message: {e}")
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        return response.status_code == 200
+    except requests.Timeout:
+        logger.error("Timeout sending LINE message")
         return False
-
-def check_if_durian_leaf(image):
-    """ตรวจสอบว่าเป็นใบทุเรียนหรือไม่ด้วยการตรวจสอบหลายเงื่อนไข"""
-    try:
-        if leaf_model is None:
-            print("Leaf detection model not loaded")
-            return False, 0
-
-        # วิเคราะห์ภาพด้วย YOLO classification
-        results = leaf_model(image)[0]
-        
-        # เพิ่มการล็อกข้อมูลสำหรับการ debug
-        print(f"Raw results: {results}")
-        
-        if not hasattr(results, 'probs') or results.probs is None:
-            print("No probability data found")
-            return False, 0
-            
-        # แสดงความน่าจะเป็นของทุกคลาส
-        probs_data = results.probs.data.cpu().numpy()
-        for idx, prob in enumerate(probs_data):
-            class_name = results.names[idx]
-            print(f"Class: {class_name}, Probability: {prob:.3f}")
-        
-        # ดึงค่า confidence และ class สูงสุด
-        class_idx = int(results.probs.argmax())
-        confidence = float(results.probs.max())
-        class_name = results.names[class_idx]
-        
-        print(f"Best match - Class: {class_name}, Confidence: {confidence:.3f}")
-        
-        # ปรับปรุงเงื่อนไขการตรวจสอบ
-        is_durian = False
-        final_confidence = 0
-        
-        if class_name == 'durian_leaf':
-            # ปรับความเข้มงวดของการตรวจจับ
-            confidence_threshold = 0.25  # ลดจาก 0.3
-            
-            # ตรวจสอบความเชื่อมั่น
-            if confidence >= confidence_threshold:
-                is_durian = True
-                final_confidence = confidence
-                print(f"Durian leaf detected with confidence: {confidence:.3f}")
-            else:
-                print(f"Confidence too low: {confidence:.3f} < {confidence_threshold}")
-                
-            # ตรวจสอบความน่าจะเป็นของคลาสอื่น
-            second_best_idx = probs_data.argsort()[-2]
-            second_best_prob = probs_data[second_best_idx]
-            margin = confidence - second_best_prob
-            
-            print(f"Margin from second best class: {margin:.3f}")
-            
-            # ถ้าความต่างน้อยเกินไป อาจไม่แน่ใจ
-            if margin < 0.1:
-                print("Small margin between classes, reducing confidence")
-                final_confidence *= 0.8  # ลดความเชื่อมั่นลง
-        else:
-            print(f"Not a durian leaf: {class_name}")
-            
-        return is_durian, final_confidence
-            
     except Exception as e:
-        print(f"Error in leaf detection: {e}")
-        import traceback
-        print(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"Error sending LINE message: {e}", exc_info=True)
+        return False
+    
+def check_disease(image, model, disease_name):
+    """ตรวจสอบโรคเฉพาะด้วยโมเดลที่กำหนด"""
+    try:
+        results = model(image)[0]
+        if not hasattr(results, 'probs') or results.probs is None:
+            return False, 0
+            
+        # ดึงความน่าจะเป็นของคลาสโรค
+        probs = results.probs.data.cpu().numpy()
+        class_names = results.names
+        
+        # หาindex ของคลาสโรค (ไม่ใช่ Not_Disease)
+        disease_idx = None
+        for idx, name in class_names.items():
+            if not name.startswith('Not_'):
+                disease_idx = idx
+                break
+                
+        if disease_idx is None:
+            return False, 0
+            
+        is_disease = float(probs[disease_idx]) > 0.5
+        confidence = float(probs[disease_idx]) if is_disease else 0
+        
+        gc.collect()  
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return is_disease, confidence
+        
+        
+    except Exception as e:
+        logger.error(f"Error in check_disease: {e}", exc_info=True)
         return False, 0
 
-# ส่วนที่เพิ่มเติม: ตรวจสอบผลการทำนายทั้งหมด
-def print_all_probabilities(results):
-    """แสดงความน่าจะเป็นของทุกคลาส"""
-    if hasattr(results, 'probs') and results.probs is not None:
-        probs = results.probs.data.cpu().numpy()
-        for idx, prob in enumerate(probs):
-            class_name = results.names[idx]
-            print(f"Class: {class_name}, Probability: {prob:.3f}")
-
 def analyze_image(image_content):
-    """วิเคราะห์รูปภาพจาก binary content"""
     try:
-        if disease_model is None:
-            print("Disease model not loaded")
+        # ตรวจสอบและเปิดรูปภาพ
+        try:
+            image = Image.open(io.BytesIO(image_content))
+            logger.info(f"Original image size: {image.size}, format: {image.format}")
+            if image.format not in ['JPEG', 'PNG', 'JPG']:
+                logger.warning(f"Unsupported image format: {image.format}")
+                return None, 0
+                
+            # ปรับขนาดรูปภาพถ้าจำเป็น
+            if image.size[0] > 1920 or image.size[1] > 1920:
+                image.thumbnail((1920, 1920))
+                logger.info(f"Image resized to {image.size}")
+                
+        except Exception as e:
+            logger.error(f"Error processing image: {e}")
             return None, 0
 
-        # แปลง bytes เป็น PIL Image
-        image = Image.open(io.BytesIO(image_content))
         
-        # วิเคราะห์โรคด้วย YOLOv11
-        results = disease_model(image)
-        print(f"Raw results: {results}")  # debug info
         
-        if not results:
-            print("No results from model")
+        # ตรวจสอบว่าเป็นใบทุเรียนก่อน
+        if leaf_model is None:
             return None, 0
             
-        result = results[0]  # get first result
-        print(f"Result object: {result}")  # debug info
-        
-        try:
-            # ดึงผลการทำนายแบบ YOLOv11 classification
-            probabilities = result.probs.data.cpu().numpy()  # แปลงเป็น numpy array
-            class_idx = probabilities.argmax()
-            confidence = float(probabilities[class_idx])
-            class_name = result.names[class_idx]
-            
-            print(f"Debug - Class: {class_name}, Confidence: {confidence}")
-            print(f"All probabilities: {probabilities}")
-            
-            # ตรวจสอบค่า confidence
-            if confidence < 0.2:
-                print(f"Low confidence: {confidence}")
-                return None, 0
-                
-            # ตรวจสอบชื่อคลาส
-            valid_classes = ['Anthracnose', 'Normal', 'Powdery', 'Rust']
-            if class_name not in valid_classes:
-                print(f"Invalid class: {class_name}")
-                return None, 0
-                
-            return class_name, confidence
-            
-        except Exception as e:
-            print(f"Error extracting prediction: {e}")
-            print(f"Result structure: {dir(result)}")  # แสดงโครงสร้างของ result
+        leaf_results = leaf_model(image)[0]
+        if not hasattr(leaf_results, 'probs') or leaf_results.probs is None:
             return None, 0
+            
+        # แก้ไขส่วนนี้
+        leaf_class_idx = leaf_results.probs.top1
+        leaf_confidence = float(leaf_results.probs.top1conf)
+        
+        if leaf_results.names[leaf_class_idx] != 'durian_leaf' or leaf_confidence < 0.25:
+            logger.info(f"Not a durian leaf or low confidence: {leaf_results.names[leaf_class_idx]}, confidence: {leaf_confidence:.2f}")
+            return None, 0
+            
+            
+        # เก็บผลการวิเคราะห์ทุกโรค
+        disease_results = []
+        for disease_name, model in disease_models.items():
+            is_disease, confidence = check_disease(image, model, disease_name)
+            if is_disease:
+                disease_results.append((disease_name, confidence))
+        
+        if disease_results:
+            best_disease = max(disease_results, key=lambda x: x[1])
+            return best_disease[0].capitalize(), best_disease[1]
+        
+        
+        if 'normal' in disease_models:
+            is_normal, normal_confidence = check_disease(image, disease_models['normal'], 'normal')
+            if is_normal:
+                return 'Normal', normal_confidence
+        
+        # Clear memory
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+                
+        return None, 0
 
     except Exception as e:
-        print(f"Error in analyze_image: {e}")
-        import traceback
-        print(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"Error in analyze_image: {e}", exc_info=True)
         return None, 0
+
 
 def create_response_messages(class_name, confidence):
     """สร้างข้อความผลการวิเคราะห์"""
@@ -213,10 +186,10 @@ def create_response_messages(class_name, confidence):
         }]
 
     # กรณีโรคแอนแทรคโนส
-    if class_name == 'Anthracnose':
+    if class_name == 'Antracnose':
         return [{
             'type': 'text',
-            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+            'text': f"🔍 ผลการวิเคราะห์ (ความมั่นใจ {confidence:.1%}):\n"
                    f"⚠️ พบโรคแอนแทรคโนส (Anthracnose Disease)\n\n"
                    f"🔸 ลักษณะอาการ:\n"
                    f"- แผลจุดสีน้ำตาลถึงดำ\n"
@@ -233,7 +206,7 @@ def create_response_messages(class_name, confidence):
     elif class_name == 'Normal':
         return [{
             'type': 'text',
-            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+            'text': f"🔍 ผลการวิเคราะห์ (ความมั่นใจ {confidence:.1%}):\n"
                    f"✅ ใบปกติ ไม่พบโรค\n\n"
                    f"🔸 ลักษณะใบ:\n"
                    f"- ใบมีสีเขียวปกติ\n"
@@ -249,7 +222,7 @@ def create_response_messages(class_name, confidence):
     elif class_name == 'Powdery':
         return [{
             'type': 'text',
-            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+            'text': f"🔍 ผลการวิเคราะห์ (ความมั่นใจ {confidence:.1%}):\n"
                    f"⚠️ พบโรคราแป้ง (Powdery Mildew)\n\n"
                    f"🔸 ลักษณะอาการ:\n"
                    f"- พบผงสีขาวคล้ายแป้งบนใบ\n"
@@ -266,7 +239,7 @@ def create_response_messages(class_name, confidence):
     elif class_name == 'Rust':
         return [{
             'type': 'text',
-            'text': f"🔍 ผลการวิเคราะห์ (ความแม่นยำ {confidence:.1%}):\n"
+            'text': f"🔍 ผลการวิเคราะห์ (ความมั่นใจ {confidence:.1%}):\n"
                    f"⚠️ พบโรคราสนิม (Rust Disease)\n\n"
                    f"🔸 ลักษณะอาการ:\n"
                    f"- พบจุดสีน้ำตาลแดงบนใบ\n"
@@ -277,6 +250,23 @@ def create_response_messages(class_name, confidence):
                    f"3. ควบคุมความชื้นในสวน\n"
                    f"4. ตรวจสอบใบข้างเคียง"
         }]
+    #กรณีเป็นโรคไฟทอป
+    elif class_name == 'Phytophthora':
+        return [{
+            'type': 'text',
+            'text': f"🔍 ผลการวิเคราะห์ (ความมั่นใจ {confidence:.1%}):\n"
+                   f"⚠️ พบโรคไฟทอปเธอร่า (Phytophthora Disease)\n\n"
+                   f"🔸 ลักษณะอาการ:\n"
+                   f"- ใบเหลืองแห้งตายเฉียบพลัน \n"
+                   f"- น้ำเลี้ยงมีสีดำ\n\n"
+                   f"🔸 คำแนะนำการจัดการ:\n"
+                   f"1. ตัดส่วนที่เป็นโรคทิ้งและเผาทำลาย\n"
+                   f"2. ปรับปรุงดินให้ระบายน้ำดี\n"
+                   f"3. หลีกเลี่ยงการให้น้ำขังในดิน\n"
+                   f"4. ตรวจสอบการระบายน้ำในแปลงปลูก"
+        }]
+        
+        
     
     # กรณีอื่นๆ
     return [{
@@ -287,32 +277,46 @@ def create_response_messages(class_name, confidence):
     }]
 
 def process_image_message(image_id, reply_token):
-    """ประมวลผลรูปภาพและส่งผลลัพธ์"""
-    try:
-        # ดาวน์โหลดรูปภาพ
-        url = f'https://api-data.line.me/v2/bot/message/{image_id}/content'
-        headers = {'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'}
-        
-        response = requests.get(url, headers=headers, timeout=3)
-        if response.status_code != 200:
-            send_line_message(reply_token, [{
+    def async_process():
+        try:
+            url = f'https://api-data.line.me/v2/bot/message/{image_id}/content'
+            headers = {'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'}
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                return [{
+                    'type': 'text',
+                    'text': '❌ ไม่สามารถดาวน์โหลดรูปภาพได้\nกรุณาลองใหม่อีกครั้ง'
+                }]
+
+            class_name, confidence = analyze_image(response.content)
+            return create_response_messages(class_name, confidence)
+
+        except Exception as e:
+            logger.error(f"Error in async_process: {e}", exc_info=True)
+            return [{
                 'type': 'text',
-                'text': '❌ ไม่สามารถดาวน์โหลดรูปภาพได้\nกรุณาลองใหม่อีกครั้ง'
-            }])
-            return
+                'text': '❌ เกิดข้อผิดพลาดในการวิเคราะห์\nกรุณาลองใหม่อีกครั้ง'
+            }]
 
-        # วิเคราะห์รูปภาพและส่งผลลัพธ์
-        class_name, confidence = analyze_image(response.content)
-        messages = create_response_messages(class_name, confidence)
+    future = executor.submit(async_process)
+    try:
+        messages = future.result(timeout=25)
         send_line_message(reply_token, messages)
-
+    except TimeoutError:
+        logger.error("Timeout in process_image_message", exc_info=True)
+        send_line_message(reply_token, [{
+            'type': 'text',
+            'text': '⚠️ การวิเคราะห์ใช้เวลานานเกินไป\nกรุณาลองใหม่อีกครั้ง'
+        }])
     except Exception as e:
-        print(f"Error in process_image_message: {e}")
+        logger.error(f"Error processing image message: {e}", exc_info=True)
         send_line_message(reply_token, [{
             'type': 'text',
             'text': '❌ เกิดข้อผิดพลาดในการวิเคราะห์\nกรุณาลองใหม่อีกครั้ง'
         }])
-        
+
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     """จัดการ webhook request"""
@@ -362,7 +366,7 @@ def webhook():
         return 'OK', 200
 
     except Exception as e:
-        print(f"Error in webhook: {e}")
+        logger.error(f"Error in webhook: {e}", exc_info=True)
         return 'OK', 200
 
 if __name__ == "__main__":
